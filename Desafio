@@ -2,7 +2,8 @@ from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel
 from typing import List
 from datetime import datetime
-from motor.motor_asyncio import AsyncIOMotorClient
+from motor.motor_asyncio import AsyncIOMotorClient, MotorError
+from bson import ObjectId
 
 app = FastAPI()
 
@@ -34,31 +35,84 @@ async def shutdown_db():
 @app.post("/produtos/")
 async def criar_produto(produto: ProductCreate):
     try:
-        novo_produto = Product(**produto.dict())
+        # Cria um dicionário a partir do modelo de dados
+        novo_produto = produto.dict()
+        novo_produto["atualizado_em"] = datetime.utcnow()  # Definir a data de atualização
+
         # Insere o produto na coleção 'produtos'
-        await app.mongodb_db.produtos.insert_one(novo_produto.dict())
+        resultado = await app.mongodb_db.produtos.insert_one(novo_produto)
+        novo_produto["id"] = str(resultado.inserted_id)  # Renomeia o campo '_id' para 'id'
+
+        # Retorna a resposta com os dados do produto criado
         return {"mensagem": "Produto criado com sucesso", "produto": novo_produto}
+
+    except MotorError as e:
+        # Captura erros relacionados ao MongoDB
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+                             detail=f"Erro ao conectar ou inserir no MongoDB: {str(e)}")
+    
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Erro ao criar produto: {str(e)}")
+        # Captura erros gerais
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, 
+                             detail=f"Erro inesperado: {str(e)}")
 
 # Endpoint para atualizar um produto
 @app.patch("/produtos/{produto_id}")
 async def atualizar_produto(produto_id: str, dados_produto: ProductCreate):
-    produto = await app.mongodb_db.produtos.find_one({"id": produto_id})
-    if not produto:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Produto não encontrado")
+    try:
+        # Busca o produto pelo ID
+        produto = await app.mongodb_db.produtos.find_one({"id": produto_id})
+        
+        if not produto:
+            # Se o produto não for encontrado, retorna um erro amigável
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, 
+                                 detail=f"Produto com id '{produto_id}' não encontrado.")
+        
+        # Atualiza os campos do produto
+        produto["nome"] = dados_produto.nome
+        produto["preco"] = dados_produto.preco
+        produto["descricao"] = dados_produto.descricao
+        
+        # Atualiza a data 'updated_at'
+        produto["atualizado_em"] = datetime.utcnow()
 
-    produto["nome"] = dados_produto.nome
-    produto["preco"] = dados_produto.preco
-    produto["descricao"] = dados_produto.descricao
-    produto["atualizado_em"] = datetime.utcnow()  # Atualiza o campo 'atualizado_em'
+        # Se o cliente deseja alterar o campo 'updated_at' diretamente, ele pode incluir no corpo da requisição
+        if dados_produto.__dict__.get('atualizado_em'):
+            produto["atualizado_em"] = dados_produto.atualizado_em
 
-    # Substitui o produto existente pelo atualizado
-    await app.mongodb_db.produtos.replace_one({"id": produto_id}, produto)
-    return {"mensagem": "Produto atualizado com sucesso", "produto": produto}
+        # Substitui o produto existente na base de dados com os dados atualizados
+        await app.mongodb_db.produtos.replace_one({"id": produto_id}, produto)
+
+        return {"mensagem": "Produto atualizado com sucesso", "produto": produto}
+    
+    except MotorError as e:
+        # Captura erros relacionados ao MongoDB
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+                             detail=f"Erro ao conectar ou atualizar no MongoDB: {str(e)}")
+
+    except Exception as e:
+        # Captura erros gerais
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, 
+                             detail=f"Erro inesperado: {str(e)}")
 
 # Endpoint para listar produtos com filtro de preço
 @app.get("/produtos/")
 async def listar_produtos(preco_minimo: float = 0, preco_maximo: float = 10000):
-    produtos = await app.mongodb_db.produtos.find({"preco": {"$gte": preco_minimo, "$lte": preco_maximo}}).to_list(length=100)
-    return {"produtos": produtos}
+    try:
+        # Aplica o filtro de preço: preço entre 5000 e 8000
+        produtos = await app.mongodb_db.produtos.find({"preco": {"$gt": preco_minimo, "$lt": preco_maximo}}).to_list(length=100)
+        for produto in produtos:
+            produto["id"] = str(produto["_id"])  # Converte o ObjectId para string
+            del produto["_id"]  # Remove o campo '_id' original
+        return {"produtos": produtos}
+    
+    except MotorError as e:
+        # Captura erros relacionados ao MongoDB (erro de consulta, conexão, etc.)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+                             detail=f"Erro ao conectar ou consultar no MongoDB: {str(e)}")
+
+    except Exception as e:
+        # Captura erros gerais
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, 
+                             detail=f"Erro inesperado: {str(e)}")
+
