@@ -1,0 +1,64 @@
+from fastapi import FastAPI, HTTPException, status
+from pydantic import BaseModel
+from typing import List
+from datetime import datetime
+from motor.motor_asyncio import AsyncIOMotorClient
+
+app = FastAPI()
+
+# Modelo para criação de produto
+class ProductCreate(BaseModel):
+    nome: str
+    preco: float
+    descricao: str
+
+# Modelo de Produto, incluindo o campo 'id' e 'updated_at'
+class Product(ProductCreate):
+    id: str
+    atualizado_em: datetime = datetime.utcnow()
+
+    class Config:
+        orm_mode = True
+
+# Configuração de conexão com o MongoDB
+@app.on_event("startup")
+async def startup_db():
+    app.mongodb_client = AsyncIOMotorClient("mongodb://localhost:27017")  # Conexão com o MongoDB
+    app.mongodb_db = app.mongodb_client.store_api  # Nome do banco de dados
+
+@app.on_event("shutdown")
+async def shutdown_db():
+    app.mongodb_client.close()  # Fecha a conexão ao final
+
+# Endpoint para criar um produto
+@app.post("/produtos/")
+async def criar_produto(produto: ProductCreate):
+    try:
+        novo_produto = Product(**produto.dict())
+        # Insere o produto na coleção 'produtos'
+        await app.mongodb_db.produtos.insert_one(novo_produto.dict())
+        return {"mensagem": "Produto criado com sucesso", "produto": novo_produto}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Erro ao criar produto: {str(e)}")
+
+# Endpoint para atualizar um produto
+@app.patch("/produtos/{produto_id}")
+async def atualizar_produto(produto_id: str, dados_produto: ProductCreate):
+    produto = await app.mongodb_db.produtos.find_one({"id": produto_id})
+    if not produto:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Produto não encontrado")
+
+    produto["nome"] = dados_produto.nome
+    produto["preco"] = dados_produto.preco
+    produto["descricao"] = dados_produto.descricao
+    produto["atualizado_em"] = datetime.utcnow()  # Atualiza o campo 'atualizado_em'
+
+    # Substitui o produto existente pelo atualizado
+    await app.mongodb_db.produtos.replace_one({"id": produto_id}, produto)
+    return {"mensagem": "Produto atualizado com sucesso", "produto": produto}
+
+# Endpoint para listar produtos com filtro de preço
+@app.get("/produtos/")
+async def listar_produtos(preco_minimo: float = 0, preco_maximo: float = 10000):
+    produtos = await app.mongodb_db.produtos.find({"preco": {"$gte": preco_minimo, "$lte": preco_maximo}}).to_list(length=100)
+    return {"produtos": produtos}
